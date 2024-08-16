@@ -27,9 +27,9 @@ try {
               echo $GITHUB_TOKEN > ~/.github-token
               chmod 0600 ~/.github-token
               # Use pip to get the Python scripts (with all the correct dependencies)
-              export PYTHONUSERBASE="$PWD/localpython"
-              export PATH="$PYTHONUSERBASE/bin:$PATH"
-              rm -rf "$PYTHONUSERBASE"
+              # export PYTHONUSERBASE="$PWD/localpython"
+              # export PATH="$PYTHONUSERBASE/bin:$PATH"
+              # rm -rf "$PYTHONUSERBASE"
               yum install -y python3-pip python3-devel python3-setuptools
               mkdir -p /local/tmp
               case $ARCHITECTURE in
@@ -112,9 +112,9 @@ try {
           sh '''
               set -ex
               [ -d /etc/profile.d/enable-alice.sh ] && source /etc/profile.d/enable-alice.sh
-              export PYTHONUSERBASE=${PWD}/python-bin
-              export PATH=${PYTHONUSERBASE}/bin:$PATH
-              export LD_LIBRARY_PATH=${PYTHONUSERBASE}/lib:${LD_LIBRARY_PATH}
+              #export PYTHONUSERBASE=${PWD}/python-bin
+              #export PATH=${PYTHONUSERBASE}/bin:$PATH
+              #export LD_LIBRARY_PATH=${PYTHONUSERBASE}/lib:${LD_LIBRARY_PATH}
               echo $NODE_NAME
               case $NODE_NAME in
                 *slc8*)
