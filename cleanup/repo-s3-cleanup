@@ -29,6 +29,8 @@ from collections import defaultdict
 from collections.abc import Iterable, Set
 from datetime import datetime, timezone, timedelta
 from itertools import chain, groupby
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from boto3 import client
 from botocore.exceptions import ClientError
 
@@ -43,6 +45,7 @@ if typing.TYPE_CHECKING:
     '''
 
 
+@lru_cache(maxsize=1024)
 def tarball_arch(key: str) -> str:
     '''Extract the architecture from a full S3 key.'''
     _, arch, *_ = key.split('/', 2)
@@ -171,13 +174,25 @@ def main(args: Namespace) -> int:
 
     # The basename includes the architecture (as .$arch.tar.gz suffix), so
     # it's safe to merge these dicts for multiple architectures.
-    symlink_targets: 'SymlinkMapping' = {
-        basename: (package, target)
-        for arch in all_archs
-        for package in list_packages(s3c, args.bucket, f'TARS/{arch}/')
-        for basename, target in load_symlink_targets(s3c, args.bucket,
-                                                     f'TARS/{arch}/{package}')
-    }
+    # Parallelize fetching symlink targets across all architectures
+    symlink_targets: 'SymlinkMapping' = {}
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = {}
+        for arch in all_archs:
+            packages = list(list_packages(s3c, args.bucket, f'TARS/{arch}/'))
+            for package in packages:
+                future = executor.submit(
+                    load_symlink_targets, s3c, args.bucket, f'TARS/{arch}/{package}'
+                )
+                futures[future] = (arch, package)
+        
+        for future in as_completed(futures):
+            arch, package = futures[future]
+            try:
+                for basename, target in future.result():
+                    symlink_targets[basename] = (package, target)
+            except Exception as exc:
+                log.error('error loading symlinks for %s/%s: %s', arch, package, exc)
 
     # Scan TARS/<arch>/store/*/*/*.tar.gz to find main tarballs.
     delete_tarballs: 'set[str]' = set()
@@ -218,15 +233,22 @@ def main(args: Namespace) -> int:
     # dependency relationships, even if dist symlinks should not be deleted.
     log.debug('fetching dist symlink names for: %s; this may take a while',
               ', '.join(all_archs))
-    dist_symlinks = (
-        key
-        for arch in all_archs
-        for dist in ('dist', 'dist-direct', 'dist-runtime')
-        for key, _, _ in
-        get_hierarchy(s3c, args.bucket, f'TARS/{arch}/{dist}/', recursive=True)
-        # Match TARS/{arch}/{dist}/{package}/{package}-{version}/*.tar.gz.
-        if key.endswith('.tar.gz') and key.count('/') == 5
-    )
+    # Parallelize fetching dist symlinks
+    dist_symlinks = []
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = []
+        for arch in all_archs:
+            for dist in ('dist', 'dist-direct', 'dist-runtime'):
+                future = executor.submit(
+                    fetch_dist_symlinks, s3c, args.bucket, arch, dist
+                )
+                futures.append(future)
+        
+        for future in as_completed(futures):
+            try:
+                dist_symlinks.extend(future.result())
+            except Exception as exc:
+                log.error('error fetching dist symlinks: %s', exc)
 
     # Fetch symlinks pointing to the tarballs to be deleted (if applicable),
     # then resolve dependencies.
@@ -387,10 +409,11 @@ def list_packages(s3c, bucket: str, arch_path: str) -> 'Iterable[str]':
 
 
 def load_symlink_targets(s3c, bucket: str, package_path: str) \
-        -> 'Iterable[tuple[str, str]]':
+        -> 'list[tuple[str, str]]':
     '''Return tuples of symlink basenames and store tarballs they point to.'''
     log = logging.getLogger(__name__)
     symlinks_seen: 'set[str]' = set()
+    results: 'list[tuple[str, str]]' = []
     manifest_key = f'{package_path}.manifest'
     try:
         log.debug('fetching object s3://%s/%s', bucket, manifest_key)
@@ -409,20 +432,54 @@ def load_symlink_targets(s3c, bucket: str, package_path: str) \
                 continue
             symlinks_seen.add(basename)
             norm = normalize_symlink_target(f'{package_path}/_', target)
-            yield (basename, norm)
+            results.append((basename, norm))
 
     # Fetch any leftover symlinks not listed in the manifest.
-    for key, _, _ in get_hierarchy(s3c, bucket, f'{package_path}/',
-                                   recursive=False):
-        if key.endswith('/'):
-            continue
-        basename = os.path.basename(key)
-        if basename in symlinks_seen or not basename.endswith('.tar.gz'):
-            continue
-        log.debug('fetching object s3://%s/%s', bucket, key)
-        target = s3c.get_object(Bucket=bucket, Key=key)['Body'] \
-                    .read().decode('utf-8').rstrip('\n')
-        yield (basename, normalize_symlink_target(key, target))
+    # Parallelize fetching individual symlink targets
+    leftover_keys = [
+        key for key, _, _ in get_hierarchy(s3c, bucket, f'{package_path}/',
+                                           recursive=False)
+        if not key.endswith('/')
+        and (basename := os.path.basename(key)) not in symlinks_seen
+        and basename.endswith('.tar.gz')
+    ]
+    
+    if leftover_keys:
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_key = {
+                executor.submit(fetch_symlink_target, s3c, bucket, key): key
+                for key in leftover_keys
+            }
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    target = future.result()
+                    basename = os.path.basename(key)
+                    results.append((basename, normalize_symlink_target(key, target)))
+                except Exception as exc:
+                    log.error('error fetching symlink %s: %s', key, exc)
+    
+    return results
+
+
+def fetch_symlink_target(s3c, bucket: str, key: str) -> str:
+    '''Fetch a single symlink target from S3.'''
+    log = logging.getLogger(__name__)
+    log.debug('fetching object s3://%s/%s', bucket, key)
+    return s3c.get_object(Bucket=bucket, Key=key)['Body'] \
+              .read().decode('utf-8').rstrip('\n')
+
+
+def fetch_dist_symlinks(s3c, bucket: str, arch: str, dist: str) -> 'list[str]':
+    '''Fetch all dist symlinks for a given architecture and dist type.'''
+    log = logging.getLogger(__name__)
+    log.debug('fetching dist symlinks for %s/%s', arch, dist)
+    return [
+        key
+        for key, _, _ in get_hierarchy(s3c, bucket, f'TARS/{arch}/{dist}/', recursive=True)
+        # Match TARS/{arch}/{dist}/{package}/{package}-{version}/*.tar.gz.
+        if key.endswith('.tar.gz') and key.count('/') == 5
+    ]
 
 
 def get_hierarchy(s3c, bucket: str, prefix: str, recursive: bool = True) \
@@ -444,6 +501,7 @@ def get_hierarchy(s3c, bucket: str, prefix: str, recursive: bool = True) \
             yield (subprefix['Prefix'], None, 0)
 
 
+@lru_cache(maxsize=8192)
 def normalize_symlink_target(symlink_key: str, target: str) -> str:
     '''Turn the target of a symlink pointing into the store into an S3 key.'''
     if target.startswith('TARS/'):
@@ -502,6 +560,9 @@ def parse_args() -> Namespace:
         '-r', '--repo-listing', default=None, type=FileType('r'),
         help=('File containing a listing of all keys in the S3 repo, in '
               '"s3cmd ls -r" format. Useful for testing and prototyping.'))
+    parser.add_argument(
+        '-w', '--max-workers', type=int, default=20, metavar='N',
+        help='maximum number of parallel S3 requests (default %(default)s)')
     parser.add_argument(
         'config_file', metavar='RULES.yaml', type=FileType('r'),
         help='YAML file specifying cleanup rules')

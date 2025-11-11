@@ -6,17 +6,34 @@
 set -e
 set -o pipefail
 
+# Error handling
+trap_error() {
+    local exit_code=$?
+    local line_number=$1
+    log "ERROR: Script failed at line $line_number with exit code $exit_code"
+    log "Command: ${BASH_COMMAND}"
+    log "Stack trace:"
+    local frame=0
+    while caller $frame; do
+        ((frame++))
+    done
+    exit $exit_code
+}
+
+trap 'trap_error ${LINENO}' ERR
+
 # Configuration
 BUCKET="s3://alibuild-repo"
 EXCLUDED_GCC_VERSION="14.2"
 DRY_RUN=true
 VERBOSE=false
+PARALLEL_JOBS=50
 
 # Architectures to process
 ARCHITECTURES=(
-    "ubuntu2204_x86-64"
+    # "ubuntu2204_x86-64"
     "ubuntu2404_x86-64"
-    "osx_arm64"
+    # "osx_arm64"
 )
 
 usage() {
@@ -32,6 +49,7 @@ Options:
     -g, --gcc-version VER   Exclude packages with GCC version VER (default: $EXCLUDED_GCC_VERSION)
     -a, --arch ARCH         Process only specified architecture (can be repeated)
                             Available: ubuntu2204_x86-64, ubuntu2404_x86-64, osx_arm64
+    -j, --jobs NUM          Number of parallel jobs for package resolution (default: $PARALLEL_JOBS)
 
 Examples:
     # Dry-run for all architectures
@@ -56,6 +74,29 @@ log_verbose() {
     fi
 }
 
+# Function to show elapsed time
+show_elapsed() {
+    local start_time=$1
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    local minutes=$((elapsed / 60))
+    local seconds=$((elapsed % 60))
+    echo "${minutes}m${seconds}s"
+}
+
+# Calculate percentage (with fallback if bc is not available)
+calc_percent() {
+    local current=$1
+    local total=$2
+    if command -v bc &>/dev/null; then
+        echo "scale=1; $current * 100 / $total" | bc -l 2>/dev/null || echo "0"
+    else
+        # Fallback: use shell arithmetic (will be integer percentage)
+        echo $(( current * 100 / total ))
+    fi
+}
+export -f calc_percent
+
 # Parse command-line arguments
 CUSTOM_ARCHS=()
 while [[ $# -gt 0 ]]; do
@@ -78,6 +119,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -a|--arch)
             CUSTOM_ARCHS+=("$2")
+            shift 2
+            ;;
+        -j|--jobs)
+            PARALLEL_JOBS="$2"
             shift 2
             ;;
         *)
@@ -106,85 +151,175 @@ log "Processing architectures: ${ARCHITECTURES[*]}"
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
+# Enhanced error handling for cleanup
+cleanup_on_exit() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log "Script terminated with errors. Temporary files preserved at: $TEMP_DIR"
+        log "To clean up manually: rm -rf $TEMP_DIR"
+        # Don't remove temp dir on error for debugging
+        trap - EXIT
+    else
+        rm -rf "$TEMP_DIR"
+    fi
+    exit $exit_code
+}
+trap cleanup_on_exit EXIT
+
 for arch in "${ARCHITECTURES[@]}"; do
+    ARCH_START_TIME=$(date +%s)
     log "Processing architecture: $arch"
     
-    # Step 1: Find all O2PDPSuite tags that depend on older GCCs
-    log_verbose "Step 1: Finding O2PDPSuite tags with old GCC dependencies..."
+    # Step 1: Find all O2PDPSuite build directories with old GCC
+    log "Step 1: Finding O2PDPSuite build directories with old GCC..."
+    STEP1_START=$(date +%s)
     
-    TAGS_FILE="$TEMP_DIR/${arch}_tags.txt"
-    s3cmd ls -r "$BUCKET/TARS/${arch}/dist/O2PDPSuite/" | \
-        grep -E "O2PDPSuite-daily-[0-9]+-[0-9]+-[0-9]+/" | \
-        awk '{print $4}' > "$TAGS_FILE" || true
-    
-    if [[ ! -s "$TAGS_FILE" ]]; then
-        log "No O2PDPSuite tags found for $arch, skipping..."
+    # List all files recursively and grep for GCC-Toolchain packages with old versions
+    ALL_FILES_FILE="$TEMP_DIR/${arch}_all_files.txt"
+    log_verbose "Running: s3cmd ls -r $BUCKET/TARS/${arch}/dist/O2PDPSuite/"
+    if ! s3cmd ls -r "$BUCKET/TARS/${arch}/dist/O2PDPSuite/" > "$ALL_FILES_FILE" 2>"$TEMP_DIR/${arch}_step1_error.log"; then
+        log "ERROR: Failed to list O2PDPSuite directory for $arch"
+        cat "$TEMP_DIR/${arch}_step1_error.log" >&2
         continue
     fi
     
+    # Find GCC-Toolchain packages that DON'T match the excluded version
     TAGS_WITH_OLD_GCC_FILE="$TEMP_DIR/${arch}_tags_old_gcc.txt"
-    > "$TAGS_WITH_OLD_GCC_FILE"
+    log_verbose "Searching for GCC-Toolchain packages not matching version ${EXCLUDED_GCC_VERSION}"
     
-    while IFS= read -r tag_dir; do
-        log_verbose "Checking tag: $tag_dir"
-        
-        # Check if this tag has packages with old GCC (not the excluded version)
-        has_old_gcc=$(s3cmd ls -r "$tag_dir" | \
-            grep -v "gcc.*-${EXCLUDED_GCC_VERSION}" | \
-            grep "gcc" | wc -l | tr -d '[:space:]' || echo "0")
-        has_old_gcc=${has_old_gcc:-0}
-        
-        if [[ "$has_old_gcc" -gt 0 ]]; then
-            log_verbose "Tag $tag_dir uses old GCC version"
-            echo "$tag_dir" >> "$TAGS_WITH_OLD_GCC_FILE"
-        fi
-    done < "$TAGS_FILE"
+    if ! grep "GCC-Toolchain.*\.tar\.gz$" "$ALL_FILES_FILE" > "$TEMP_DIR/${arch}_gcc_packages.txt"; then
+        log "No GCC-Toolchain packages found for $arch, skipping..."
+        continue
+    fi
+    
+    log_verbose "Found $(wc -l < "$TEMP_DIR/${arch}_gcc_packages.txt") GCC-Toolchain package(s)"
+    
+    grep -v "GCC-Toolchain-v${EXCLUDED_GCC_VERSION}" "$TEMP_DIR/${arch}_gcc_packages.txt" | \
+        awk '{print $4}' | \
+        sed 's|/[^/]*\.tar\.gz$|/|' | \
+        sort -u > "$TAGS_WITH_OLD_GCC_FILE" || true
+    
+    log "Step 1 completed in $(show_elapsed $STEP1_START)"
     
     if [[ ! -s "$TAGS_WITH_OLD_GCC_FILE" ]]; then
-        log "No tags with old GCC found for $arch, skipping..."
+        log "No build directories with old GCC found for $arch (all using GCC ${EXCLUDED_GCC_VERSION}), skipping..."
         continue
     fi
     
-    TAG_COUNT=$(wc -l < "$TAGS_WITH_OLD_GCC_FILE")
-    log "Found $TAG_COUNT tag(s) with old GCC dependencies for $arch"
+    OLD_GCC_TAG_COUNT=$(wc -l < "$TAGS_WITH_OLD_GCC_FILE")
+    log "Found $OLD_GCC_TAG_COUNT build directory(ies) with old GCC dependencies for $arch"
     
-    # Step 2 & 3: For each tag, get packages and translate to store paths
-    log_verbose "Step 2-3: Getting packages and translating to store paths..."
+    # Step 2: For each build directory, collect all package symlinks
+    log "Step 2: Collecting package symlinks from $OLD_GCC_TAG_COUNT build directories..."
+    STEP2_START=$(date +%s)
     
     STORE_PATHS_FILE="$TEMP_DIR/${arch}_store_paths.txt"
     > "$STORE_PATHS_FILE"
     
+    # Collect all package symlinks from all build directories
+    ALL_PACKAGES_FILE="$TEMP_DIR/${arch}_all_packages.txt"
+    > "$ALL_PACKAGES_FILE"
+    
+    tag_num=0
     while IFS= read -r tag_dir; do
-        log_verbose "Processing packages in: $tag_dir"
+        tag_num=$((tag_num + 1))
+        printf "\r  Progress: %d/%d build directories listed..." "$tag_num" "$OLD_GCC_TAG_COUNT" >&2
+        log_verbose "Listing packages in: $tag_dir"
+        # List all .tar.gz files in this build directory (these are symlink text files)
+        s3cmd ls "$tag_dir" 2>/dev/null | \
+            awk '$4 ~ /\.tar\.gz$/ {print $4}' >> "$ALL_PACKAGES_FILE" || true
+    done < "$TAGS_WITH_OLD_GCC_FILE"
+    printf "\n" >&2
+    
+    log "Step 2 completed in $(show_elapsed $STEP2_START)"
+    
+    if [[ ! -s "$ALL_PACKAGES_FILE" ]]; then
+        log "No packages found for $arch, skipping..."
+        continue
+    fi
+    
+    PACKAGE_COUNT=$(wc -l < "$ALL_PACKAGES_FILE")
+    log "Step 3: Resolving $PACKAGE_COUNT package symlinks to store paths in parallel (max $PARALLEL_JOBS jobs)..."
+    STEP3_START=$(date +%s)
+    
+    # Function to process a single package symlink
+    process_package() {
+        local package_url="$1"
+        local temp_output="$2"
+        local progress_file="$3"
+        local error_log="$4"
         
-        # Get all packages in this tag
-        PACKAGES_FILE="$TEMP_DIR/${arch}_packages_$(basename "$tag_dir").txt"
-        s3cmd ls -r "$tag_dir" | \
-            grep "\.tar\.gz$" | \
-            awk '{print $4}' > "$PACKAGES_FILE"
-        
-        if [[ ! -s "$PACKAGES_FILE" ]]; then
-            log_verbose "No packages found in $tag_dir"
-            continue
+        # Fetch the symlink content (these are text files containing the real store path)
+        local store_path
+        if ! store_path=$(s3cmd get "$package_url" -q - 2>"${error_log}.${package_url//\//_}"); then
+            echo "ERROR: Failed to fetch $package_url" >> "$error_log"
+            echo "1" >> "$progress_file"
+            return 1
         fi
         
-        # For each package, get the store path
-        while IFS= read -r package_url; do
-            log_verbose "Translating package: $package_url"
-            
-            # Get the symlink target (store path)
-            store_path=$(s3cmd get "$package_url" -q - 2>/dev/null || echo "")
-            
-            if [[ -n "$store_path" && "$store_path" == TARS/* ]]; then
-                # Normalize to full S3 URL
-                full_store_path="${BUCKET}/${store_path}"
-                echo "$full_store_path" >> "$STORE_PATHS_FILE"
-                log_verbose "Store path: $full_store_path"
-            else
-                log_verbose "Could not resolve store path for $package_url"
+        # Clean up the output (remove newlines and trailing %)
+        store_path=$(echo "$store_path" | tr -d '\n' | sed 's/%$//')
+        
+        if [[ -n "$store_path" && "$store_path" == TARS/* ]]; then
+            # Prepend bucket to get full S3 URL
+            local full_store_path="${BUCKET}/${store_path}"
+            echo "$full_store_path" >> "$temp_output"
+        else
+            echo "WARNING: Invalid store path for $package_url: '$store_path'" >> "$error_log"
+        fi
+        
+        # Update progress counter
+        echo "1" >> "$progress_file"
+    }
+    export -f process_package
+    export BUCKET
+    
+    # Create progress tracking file for packages
+    PACKAGE_PROGRESS_FILE="$TEMP_DIR/${arch}_package_progress.txt"
+    > "$PACKAGE_PROGRESS_FILE"
+    
+    # Create error log file
+    ERROR_LOG_FILE="$TEMP_DIR/${arch}_errors.log"
+    > "$ERROR_LOG_FILE"
+    
+    # Start progress monitor in background
+    (
+        while true; do
+            if [[ -f "$PACKAGE_PROGRESS_FILE" ]]; then
+                resolved=$(wc -l < "$PACKAGE_PROGRESS_FILE" 2>/dev/null || echo 0)
+                if [[ $resolved -ge $PACKAGE_COUNT ]]; then
+                    break
+                fi
+                # Use \r to overwrite the same line
+                pct=$(calc_percent "$resolved" "$PACKAGE_COUNT")
+                printf "\r  Progress: %d/%d packages resolved (%s%%)..." "$resolved" "$PACKAGE_COUNT" "$pct" >&2
             fi
-        done < "$PACKAGES_FILE"
-    done < "$TAGS_WITH_OLD_GCC_FILE"
+            sleep 1
+        done
+        # Final update
+        printf "\r  Progress: %d/%d packages resolved (100%%)    \n" "$PACKAGE_COUNT" "$PACKAGE_COUNT" >&2
+    ) &
+    PACKAGE_PROGRESS_PID=$!
+    
+    # Process all packages in parallel using xargs
+    cat "$ALL_PACKAGES_FILE" | xargs -P "$PARALLEL_JOBS" -I {} bash -c 'process_package "$@"' _ {} "$STORE_PATHS_FILE" "$PACKAGE_PROGRESS_FILE" "$ERROR_LOG_FILE"
+    
+    # Wait for progress monitor to finish
+    wait $PACKAGE_PROGRESS_PID 2>/dev/null || true
+    
+    # Check for errors
+    if [[ -s "$ERROR_LOG_FILE" ]]; then
+        ERROR_COUNT=$(wc -l < "$ERROR_LOG_FILE")
+        log "WARNING: Encountered $ERROR_COUNT error(s) during package resolution"
+        log_verbose "Error details:"
+        if [[ "$VERBOSE" == "true" ]]; then
+            cat "$ERROR_LOG_FILE" >&2
+        else
+            log "Run with -v/--verbose to see error details, or check: $ERROR_LOG_FILE"
+        fi
+    fi
+    
+    log "Step 3 completed in $(show_elapsed $STEP3_START)"
     
     if [[ ! -s "$STORE_PATHS_FILE" ]]; then
         log "No store paths found for $arch, skipping..."
@@ -205,10 +340,12 @@ for arch in "${ARCHITECTURES[@]}"; do
     else
         DELETED=0
         FAILED=0
+        DELETION_ERROR_LOG="$TEMP_DIR/${arch}_deletion_errors.log"
+        > "$DELETION_ERROR_LOG"
         
         while IFS= read -r store_path; do
             log_verbose "Deleting: $store_path"
-            if s3cmd rm "$store_path" 2>&1; then
+            if s3cmd rm "$store_path" 2>>"$DELETION_ERROR_LOG"; then
                 ((DELETED++))
                 log_verbose "Deleted: $store_path"
             else
@@ -220,10 +357,14 @@ for arch in "${ARCHITECTURES[@]}"; do
         log "Deleted $DELETED store path(s) for $arch"
         if [[ $FAILED -gt 0 ]]; then
             log "WARNING: Failed to delete $FAILED store path(s) for $arch"
+            log "Deletion errors logged to: $DELETION_ERROR_LOG"
+            if [[ "$VERBOSE" == "true" ]]; then
+                cat "$DELETION_ERROR_LOG" >&2
+            fi
         fi
     fi
     
-    log "Finished processing architecture: $arch"
+    log "Finished processing architecture: $arch (total time: $(show_elapsed $ARCH_START_TIME))"
     echo ""
 done
 

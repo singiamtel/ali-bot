@@ -100,8 +100,8 @@
     days: 7
 
 - architectures:
-    - ubuntu2004_x86-64
     - ubuntu2204_x86-64
+    - ubuntu2404_x86-64
   packages:
     - O2PDPSuite
     - O2
