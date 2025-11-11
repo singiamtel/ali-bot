@@ -151,6 +151,11 @@ log "Processing architectures: ${ARCHITECTURES[*]}"
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
+# Output directory for persistent results
+OUTPUT_DIR="$(pwd)/cleanup-output-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$OUTPUT_DIR"
+log "Output directory: $OUTPUT_DIR"
+
 # Enhanced error handling for cleanup
 cleanup_on_exit() {
     local exit_code=$?
@@ -208,6 +213,11 @@ for arch in "${ARCHITECTURES[@]}"; do
     
     OLD_GCC_TAG_COUNT=$(wc -l < "$TAGS_WITH_OLD_GCC_FILE")
     log "Found $OLD_GCC_TAG_COUNT build directory(ies) with old GCC dependencies for $arch"
+    
+    # Save tags to output file
+    TAGS_OUTPUT_FILE="$OUTPUT_DIR/${arch}_tags_old_gcc.txt"
+    cp "$TAGS_WITH_OLD_GCC_FILE" "$TAGS_OUTPUT_FILE"
+    log "Tags saved to: $TAGS_OUTPUT_FILE"
     
     # Step 2: For each build directory, collect all package symlinks
     log "Step 2: Collecting package symlinks from $OLD_GCC_TAG_COUNT build directories..."
@@ -331,6 +341,11 @@ for arch in "${ARCHITECTURES[@]}"; do
     STORE_COUNT=$(wc -l < "$STORE_PATHS_FILE")
     log "Found $STORE_COUNT unique store path(s) to delete for $arch"
     
+    # Save store paths to output file
+    STORE_PATHS_OUTPUT_FILE="$OUTPUT_DIR/${arch}_store_paths.txt"
+    cp "$STORE_PATHS_FILE" "$STORE_PATHS_OUTPUT_FILE"
+    log "Store paths saved to: $STORE_PATHS_OUTPUT_FILE"
+    
     # Step 4: Delete the store paths (but not the symlinks)
     log "Step 4: Deleting store paths..."
     
@@ -369,6 +384,9 @@ for arch in "${ARCHITECTURES[@]}"; do
 done
 
 log "Cleanup complete!"
+log "All results saved to: $OUTPUT_DIR"
+log "  - <arch>_tags_old_gcc.txt: Build directories with old GCC"
+log "  - <arch>_store_paths.txt: Store paths identified for cleanup"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     log "This was a DRY-RUN. Use -y/--do-it to actually delete packages."
