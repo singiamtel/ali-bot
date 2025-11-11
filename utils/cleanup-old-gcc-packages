@@ -1,0 +1,234 @@
+#!/bin/bash
+
+# Script to clean up O2PDPSuite packages that depend on older GCC versions
+# For ubuntu2204, ubuntu2404, and macOS architectures
+
+set -e
+set -o pipefail
+
+# Configuration
+BUCKET="s3://alibuild-repo"
+EXCLUDED_GCC_VERSION="14.2"
+DRY_RUN=true
+VERBOSE=false
+
+# Architectures to process
+ARCHITECTURES=(
+    "ubuntu2204_x86-64"
+    "ubuntu2404_x86-64"
+    "osx_arm64"
+)
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Clean up O2PDPSuite packages that depend on older GCC versions.
+
+Options:
+    -h, --help              Show this help message
+    -y, --do-it             Actually perform deletions (default: dry-run)
+    -v, --verbose           Show verbose output
+    -g, --gcc-version VER   Exclude packages with GCC version VER (default: $EXCLUDED_GCC_VERSION)
+    -a, --arch ARCH         Process only specified architecture (can be repeated)
+                            Available: ubuntu2204_x86-64, ubuntu2404_x86-64, osx_arm64
+
+Examples:
+    # Dry-run for all architectures
+    $(basename "$0")
+
+    # Actually delete packages for ubuntu2404 only
+    $(basename "$0") -y -a ubuntu2404_x86-64
+
+    # Dry-run excluding GCC 13.2
+    $(basename "$0") -g 13.2
+
+EOF
+}
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        log "$@"
+    fi
+}
+
+# Parse command-line arguments
+CUSTOM_ARCHS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -y|--do-it)
+            DRY_RUN=false
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -g|--gcc-version)
+            EXCLUDED_GCC_VERSION="$2"
+            shift 2
+            ;;
+        -a|--arch)
+            CUSTOM_ARCHS+=("$2")
+            shift 2
+            ;;
+        *)
+            echo "Error: Unknown option $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Use custom architectures if specified
+if [[ ${#CUSTOM_ARCHS[@]} -gt 0 ]]; then
+    ARCHITECTURES=("${CUSTOM_ARCHS[@]}")
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log "DRY-RUN MODE: No packages will be deleted"
+else
+    log "WARNING: Deletions will be performed!"
+fi
+
+log "Excluding GCC version: $EXCLUDED_GCC_VERSION"
+log "Processing architectures: ${ARCHITECTURES[*]}"
+
+# Temporary directory for storing intermediate results
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+for arch in "${ARCHITECTURES[@]}"; do
+    log "Processing architecture: $arch"
+    
+    # Step 1: Find all O2PDPSuite tags that depend on older GCCs
+    log_verbose "Step 1: Finding O2PDPSuite tags with old GCC dependencies..."
+    
+    TAGS_FILE="$TEMP_DIR/${arch}_tags.txt"
+    s3cmd ls -r "$BUCKET/TARS/${arch}/dist/O2PDPSuite/" | \
+        grep -E "O2PDPSuite-daily-[0-9]+-[0-9]+-[0-9]+/" | \
+        awk '{print $4}' > "$TAGS_FILE" || true
+    
+    if [[ ! -s "$TAGS_FILE" ]]; then
+        log "No O2PDPSuite tags found for $arch, skipping..."
+        continue
+    fi
+    
+    TAGS_WITH_OLD_GCC_FILE="$TEMP_DIR/${arch}_tags_old_gcc.txt"
+    > "$TAGS_WITH_OLD_GCC_FILE"
+    
+    while IFS= read -r tag_dir; do
+        log_verbose "Checking tag: $tag_dir"
+        
+        # Check if this tag has packages with old GCC (not the excluded version)
+        has_old_gcc=$(s3cmd ls -r "$tag_dir" | \
+            grep -v "gcc.*-${EXCLUDED_GCC_VERSION}" | \
+            grep "gcc" | wc -l | tr -d '[:space:]' || echo "0")
+        has_old_gcc=${has_old_gcc:-0}
+        
+        if [[ "$has_old_gcc" -gt 0 ]]; then
+            log_verbose "Tag $tag_dir uses old GCC version"
+            echo "$tag_dir" >> "$TAGS_WITH_OLD_GCC_FILE"
+        fi
+    done < "$TAGS_FILE"
+    
+    if [[ ! -s "$TAGS_WITH_OLD_GCC_FILE" ]]; then
+        log "No tags with old GCC found for $arch, skipping..."
+        continue
+    fi
+    
+    TAG_COUNT=$(wc -l < "$TAGS_WITH_OLD_GCC_FILE")
+    log "Found $TAG_COUNT tag(s) with old GCC dependencies for $arch"
+    
+    # Step 2 & 3: For each tag, get packages and translate to store paths
+    log_verbose "Step 2-3: Getting packages and translating to store paths..."
+    
+    STORE_PATHS_FILE="$TEMP_DIR/${arch}_store_paths.txt"
+    > "$STORE_PATHS_FILE"
+    
+    while IFS= read -r tag_dir; do
+        log_verbose "Processing packages in: $tag_dir"
+        
+        # Get all packages in this tag
+        PACKAGES_FILE="$TEMP_DIR/${arch}_packages_$(basename "$tag_dir").txt"
+        s3cmd ls -r "$tag_dir" | \
+            grep "\.tar\.gz$" | \
+            awk '{print $4}' > "$PACKAGES_FILE"
+        
+        if [[ ! -s "$PACKAGES_FILE" ]]; then
+            log_verbose "No packages found in $tag_dir"
+            continue
+        fi
+        
+        # For each package, get the store path
+        while IFS= read -r package_url; do
+            log_verbose "Translating package: $package_url"
+            
+            # Get the symlink target (store path)
+            store_path=$(s3cmd get "$package_url" -q - 2>/dev/null || echo "")
+            
+            if [[ -n "$store_path" && "$store_path" == TARS/* ]]; then
+                # Normalize to full S3 URL
+                full_store_path="${BUCKET}/${store_path}"
+                echo "$full_store_path" >> "$STORE_PATHS_FILE"
+                log_verbose "Store path: $full_store_path"
+            else
+                log_verbose "Could not resolve store path for $package_url"
+            fi
+        done < "$PACKAGES_FILE"
+    done < "$TAGS_WITH_OLD_GCC_FILE"
+    
+    if [[ ! -s "$STORE_PATHS_FILE" ]]; then
+        log "No store paths found for $arch, skipping..."
+        continue
+    fi
+    
+    # Sort and deduplicate store paths
+    sort -u "$STORE_PATHS_FILE" -o "$STORE_PATHS_FILE"
+    STORE_COUNT=$(wc -l < "$STORE_PATHS_FILE")
+    log "Found $STORE_COUNT unique store path(s) to delete for $arch"
+    
+    # Step 4: Delete the store paths (but not the symlinks)
+    log "Step 4: Deleting store paths..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY-RUN: Would delete the following store paths for $arch:"
+        cat "$STORE_PATHS_FILE"
+    else
+        DELETED=0
+        FAILED=0
+        
+        while IFS= read -r store_path; do
+            log_verbose "Deleting: $store_path"
+            if s3cmd rm "$store_path" 2>&1; then
+                ((DELETED++))
+                log_verbose "Deleted: $store_path"
+            else
+                ((FAILED++))
+                log "Failed to delete: $store_path"
+            fi
+        done < "$STORE_PATHS_FILE"
+        
+        log "Deleted $DELETED store path(s) for $arch"
+        if [[ $FAILED -gt 0 ]]; then
+            log "WARNING: Failed to delete $FAILED store path(s) for $arch"
+        fi
+    fi
+    
+    log "Finished processing architecture: $arch"
+    echo ""
+done
+
+log "Cleanup complete!"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    log "This was a DRY-RUN. Use -y/--do-it to actually delete packages."
+fi
